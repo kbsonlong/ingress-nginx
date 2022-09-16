@@ -114,10 +114,13 @@ func GetRemovedIngresses(rucfg, newcfg *ingress.Configuration) []string {
 
 // IsDynamicConfigurationEnough returns whether a Configuration can be
 // dynamically applied, without reloading the backend.
+// 判断是否nginx 可以动态重载，不需要执行reload
 func IsDynamicConfigurationEnough(newcfg *ingress.Configuration, oldcfg *ingress.Configuration) bool {
 	copyOfRunningConfig := *oldcfg
 	copyOfPcfg := *newcfg
 
+	// 可以看到，在比较配置文件的时候，backend字段会设置为空
+	// 所以只是backend字段更新不会触发reload
 	copyOfRunningConfig.Backends = []*ingress.Backend{}
 	copyOfPcfg.Backends = []*ingress.Backend{}
 

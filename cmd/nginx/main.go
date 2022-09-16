@@ -103,6 +103,7 @@ func main() {
 	conf.FakeCertificate = ssl.GetFakeSSLCert()
 	klog.InfoS("SSL fake certificate created", "file", conf.FakeCertificate.PemFileName)
 
+	// 检查版本信息
 	if !k8s.NetworkingIngressAvailable(kubeClient) {
 		klog.Fatalf("ingress-nginx requires Kubernetes v1.19.0 or higher")
 	}
@@ -122,7 +123,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Unexpected error obtaining ingress-nginx pod: %v", err)
 	}
-
+	// 注册Prometheus
 	reg := prometheus.NewRegistry()
 
 	reg.MustRegister(collectors.NewGoCollector())
@@ -131,6 +132,7 @@ func main() {
 		ReportErrors: true,
 	}))
 
+	// metric指标数据采集，mc是一个用于收集指标的collector实例
 	mc := metric.NewDummyCollector()
 	if conf.EnableMetrics {
 		mc, err = metric.NewCollector(conf.MetricsPerHost, conf.ReportStatusClasses, reg, conf.IngressClassConfiguration.Controller, *conf.MetricsBuckets)
@@ -142,10 +144,12 @@ func main() {
 	// for the admissionWebhook
 	mc.Start(conf.ValidationWebhook)
 
+	// 启用性能调试端口
 	if conf.EnableProfiling {
 		go metrics.RegisterProfiler("127.0.0.1", nginx.ProfilerPort)
 	}
 
+	// 实例 ngx controller 化控制器
 	ngx := controller.NewNGINXController(conf, mc)
 
 	mux := http.NewServeMux()
@@ -159,7 +163,10 @@ func main() {
 
 	}
 
+	// 启动健康检查和 metrics API 接口
 	go metrics.StartHTTPServer(conf.HealthCheckHost, conf.ListenPorts.Health, mux)
+
+	// 启动 nginx master 进程
 	go ngx.Start()
 
 	process.HandleSigterm(ngx, conf.PostShutdownGracePeriod, func(code int) {

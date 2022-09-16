@@ -1,0 +1,778 @@
+diff --git a/cmd/nginx/main.go b/cmd/nginx/main.go
+index c585ed95e..f689cf541 100644
+--- a/cmd/nginx/main.go
++++ b/cmd/nginx/main.go
+@@ -103,6 +103,7 @@ func main() {
+ 	conf.FakeCertificate = ssl.GetFakeSSLCert()
+ 	klog.InfoS("SSL fake certificate created", "file", conf.FakeCertificate.PemFileName)
+ 
++	// 检查版本信息
+ 	if !k8s.NetworkingIngressAvailable(kubeClient) {
+ 		klog.Fatalf("ingress-nginx requires Kubernetes v1.19.0 or higher")
+ 	}
+@@ -122,7 +123,7 @@ func main() {
+ 	if err != nil {
+ 		klog.Fatalf("Unexpected error obtaining ingress-nginx pod: %v", err)
+ 	}
+-
++	// 注册Prometheus
+ 	reg := prometheus.NewRegistry()
+ 
+ 	reg.MustRegister(collectors.NewGoCollector())
+@@ -131,6 +132,7 @@ func main() {
+ 		ReportErrors: true,
+ 	}))
+ 
++	// metric指标数据采集，mc是一个用于收集指标的collector实例
+ 	mc := metric.NewDummyCollector()
+ 	if conf.EnableMetrics {
+ 		mc, err = metric.NewCollector(conf.MetricsPerHost, conf.ReportStatusClasses, reg, conf.IngressClassConfiguration.Controller, *conf.MetricsBuckets)
+@@ -142,10 +144,12 @@ func main() {
+ 	// for the admissionWebhook
+ 	mc.Start(conf.ValidationWebhook)
+ 
++	// 启用性能调试端口
+ 	if conf.EnableProfiling {
+ 		go metrics.RegisterProfiler("127.0.0.1", nginx.ProfilerPort)
+ 	}
+ 
++	// 实例 ngx controller 化控制器
+ 	ngx := controller.NewNGINXController(conf, mc)
+ 
+ 	mux := http.NewServeMux()
+@@ -159,7 +163,10 @@ func main() {
+ 
+ 	}
+ 
++	// 启动健康检查和 metrics API 接口
+ 	go metrics.StartHTTPServer(conf.HealthCheckHost, conf.ListenPorts.Health, mux)
++
++	// 启动 nginx master 进程
+ 	go ngx.Start()
+ 
+ 	process.HandleSigterm(ngx, conf.PostShutdownGracePeriod, func(code int) {
+diff --git a/internal/ingress/controller/controller.go b/internal/ingress/controller/controller.go
+index 5287034c6..dafa17470 100644
+--- a/internal/ingress/controller/controller.go
++++ b/internal/ingress/controller/controller.go
+@@ -144,19 +144,28 @@ func (n NGINXController) GetPublishService() *apiv1.Service {
+ // syncIngress collects all the pieces required to assemble the NGINX
+ // configuration file and passes the resulting data structures to the backend
+ // (OnUpdate) when a reload is deemed necessary.
++// 同步Ingress
+ func (n *NGINXController) syncIngress(interface{}) error {
++	// 同步队列限流器
+ 	n.syncRateLimiter.Accept()
+ 
+ 	if n.syncQueue.IsShuttingDown() {
+ 		return nil
+ 	}
+ 
++	// 获取最所有的ingress对象, 这个ingress对象是有ParsedAnnotations字段的
+ 	ings := n.store.ListIngresses()
++	// 通过getConfiguration方法将ingress分为hosts,servers，pcfg三个部分
++	// host是ingress定义的域名
++	// servers对应nginx里的每个server指令所需的数据, 每个域名会创建一个server {server_name xxx; ....}的配置
++	// pcfg是后面用来渲染nginx的模板
+ 	hosts, servers, pcfg := n.getConfiguration(ings)
+ 
+ 	n.metricCollector.SetSSLExpireTime(servers)
+ 	n.metricCollector.SetSSLInfo(servers)
+ 
++	// 判断当前配置与集群中的数据是否一致
++	// controller刚启动的时候runningConfig为空，所以首次触发就会更新模板
+ 	if n.runningConfig.Equal(pcfg) {
+ 		klog.V(3).Infof("No configuration change detected, skipping backend reload")
+ 		return nil
+@@ -164,15 +173,19 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 
+ 	n.metricCollector.SetHosts(hosts)
+ 
++	// 判断是否有必要重新渲染模板并执行nginx -s reload
++	// 如果只是backend更新，不会重新渲染模板的
+ 	if !utilingress.IsDynamicConfigurationEnough(pcfg, n.runningConfig) {
+ 		klog.InfoS("Configuration changes detected, backend reload required")
+ 
++		// 生成checksum hash值
+ 		hash, _ := hashstructure.Hash(pcfg, &hashstructure.HashOptions{
+ 			TagName: "json",
+ 		})
+ 
+ 		pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
+ 
++		// 当监听到配置发生变化，同步循环将调用OnUdate
+ 		err := n.OnUpdate(*pcfg)
+ 		if err != nil {
+ 			n.metricCollector.IncReloadErrorCount()
+@@ -189,6 +202,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 		n.recorder.Eventf(k8s.IngressPodDetails, apiv1.EventTypeNormal, "RELOAD", "NGINX reload triggered due to a change in configuration")
+ 	}
+ 
++	// 如果是第一次启动，等待一秒，让nginx有时间监听端口以便后续的动态更新
+ 	isFirstSync := n.runningConfig.Equal(&ingress.Configuration{})
+ 	if isFirstSync {
+ 		// For the initial sync it always takes some time for NGINX to start listening
+@@ -197,6 +211,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 		time.Sleep(1 * time.Second)
+ 	}
+ 
++	// 重试机制
+ 	retry := wait.Backoff{
+ 		Steps:    1 + n.cfg.DynamicConfigurationRetries,
+ 		Duration: time.Second,
+@@ -205,7 +220,10 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 	}
+ 
+ 	retriesRemaining := retry.Steps
++	// 这里可以看到，无论数据是否更新都会调用configureDynamically
++	// configureDynamically 会判断是否有必要更新后端
+ 	err := wait.ExponentialBackoff(retry, func() (bool, error) {
++		// 动态更新 nginx 配置
+ 		err := n.configureDynamically(pcfg)
+ 		if err == nil {
+ 			klog.V(2).Infof("Dynamic reconfiguration succeeded.")
+@@ -224,6 +242,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 		return err
+ 	}
+ 
++	// 更新指标数据
+ 	ri := utilingress.GetRemovedIngresses(n.runningConfig, pcfg)
+ 	re := utilingress.GetRemovedHosts(n.runningConfig, pcfg)
+ 	rc := utilingress.GetRemovedCertificateSerialNumbers(n.runningConfig, pcfg)
+@@ -234,6 +253,12 @@ func (n *NGINXController) syncIngress(interface{}) error {
+ 	return nil
+ }
+ 
++// syncIngress 方法总结
++// k8s集群里监听的资源(ingress, configmap, service, endpoint等)发生变化之后就会触发syncIngress方法，
++// syncIngress方法会比对当前的配置与集群的配置是否一致，如果一致就跳过，如果不一致就判断是否只要动态更新，
++// 如果动态更新不能满足要求就重新生成配置文件并执行命令 nginx -s reload,
++// 最后判断是否需要动态更新，如果需要就发送POST请求到nginx执行动态更新。
++
+ // CheckIngress returns an error in case the provided ingress, when added
+ // to the current configuration, generates an invalid configuration
+ func (n *NGINXController) CheckIngress(ing *networking.Ingress) error {
+diff --git a/internal/ingress/controller/nginx.go b/internal/ingress/controller/nginx.go
+index 4b543ea2f..efd4a888f 100644
+--- a/internal/ingress/controller/nginx.go
++++ b/internal/ingress/controller/nginx.go
+@@ -72,17 +72,20 @@ const (
+ 
+ // NewNGINXController creates a new NGINX Ingress controller.
+ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXController {
++	// kubectl describe 命令看到的事件日志就是这个库产生的
+ 	eventBroadcaster := record.NewBroadcaster()
+ 	eventBroadcaster.StartLogging(klog.Infof)
+ 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{
+ 		Interface: config.Client.CoreV1().Events(config.Namespace),
+ 	})
+ 
++	// 读取pod里面的/etc/resolv.conf
+ 	h, err := dns.GetSystemNameServers()
+ 	if err != nil {
+ 		klog.Warningf("Error reading system nameservers: %v", err)
+ 	}
+ 
++	// 实例化 NGINXController
+ 	n := &NGINXController{
+ 		isIPV6Enabled: ing_net.IsIPv6Enabled(),
+ 
+@@ -101,15 +104,18 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 
+ 		stopLock: &sync.Mutex{},
+ 
++		// 当前运行的配置文件，刚启动是为空
+ 		runningConfig: new(ingress.Configuration),
+ 
+ 		Proxy: &tcpproxy.TCPProxy{},
+ 
+ 		metricCollector: mc,
+ 
++		// 一个可以调用 nginx -c nginx.conf 命令的对象
+ 		command: NewNginxCommand(),
+ 	}
+ 
++	// 启动 webhook 服务
+ 	if n.cfg.ValidationWebhook != "" {
+ 		n.validationWebhookServer = &http.Server{
+ 			Addr: config.ValidationWebhook,
+@@ -124,6 +130,8 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 		}
+ 	}
+ 
++	// 实例化 store (本地缓存)
++	// store 对象，很重要，数据缓存与k8s交互的接口都在这个对象
+ 	n.store = store.New(
+ 		config.Namespace,
+ 		config.WatchNamespaceSelector,
+@@ -138,6 +146,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 		config.DeepInspector,
+ 		config.IngressClassConfiguration)
+ 
++	// 创建工作队列，这里把 syncIngress 注册到这个工作队列
+ 	n.syncQueue = task.NewTaskQueue(n.syncIngress)
+ 
+ 	if config.UpdateStatus {
+@@ -153,7 +162,9 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 		klog.Warning("Update of Ingress status is disabled (flag --update-status)")
+ 	}
+ 
++	// 监听模板文件更新
+ 	onTemplateChange := func() {
++		// 渲染模板
+ 		template, err := ngx_template.NewTemplate(nginx.TemplatePath)
+ 		if err != nil {
+ 			// this error is different from the rest because it must be clear why nginx is not working
+@@ -161,11 +172,13 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 			return
+ 		}
+ 
++		// 若模板渲染正确，则更新到 nginxcontroller 对象中，并往同步队列发送一个 template-change 事件
+ 		n.t = template
+ 		klog.InfoS("New NGINX configuration template loaded")
+ 		n.syncQueue.EnqueueTask(task.GetDummyObject("template-change"))
+ 	}
+ 
++	// 首次启动加载配置模板文件
+ 	ngxTpl, err := ngx_template.NewTemplate(nginx.TemplatePath)
+ 	if err != nil {
+ 		klog.Fatalf("Invalid NGINX configuration template: %v", err)
+@@ -173,6 +186,9 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 
+ 	n.t = ngxTpl
+ 
++	// 监听模板文件变化
++	// 监听 /etc/nginx/template/nginx.tmpl 模板文件是否有变化，有变化则调用 onTemplateChange
++
+ 	_, err = file.NewFileWatcher(nginx.TemplatePath, onTemplateChange)
+ 	if err != nil {
+ 		klog.Fatalf("Error creating file watcher for %v: %v", nginx.TemplatePath, err)
+@@ -196,6 +212,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 		klog.Fatalf("Error creating file watchers: %v", err)
+ 	}
+ 
++	// 配置文件有变化则往同步队列发送一个 file-change 事件
+ 	for _, f := range filesToWatch {
+ 		_, err = file.NewFileWatcher(f, func() {
+ 			klog.InfoS("File changed detected. Reloading NGINX", "path", f)
+@@ -209,16 +226,26 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
+ 	return n
+ }
+ 
++// NGINXController对象并不直接与集群打交道，
++// 而是通过将交互接口全部抽象到store对象，ingress, configmap, service等资源的事件响应也全部放在store里面，
++// store负责判断对象是否应该传递给NGINXController的主循环, 然后将数据缓存到本地, 以便后面让NGINXController对象查询，
++// NGINXController对象主要负责怎么将资源的变更同步给nginx，比如怎么渲染模板，是否动态更新数据给nginx。
++
+ // NGINXController describes a NGINX Ingress controller.
+ type NGINXController struct {
++	// 配置信息
+ 	cfg *Configuration
+ 
++	// 事件通知器
+ 	recorder record.EventRecorder
+ 
++	// 同步队列
+ 	syncQueue *task.Queue
+ 
++	// 同步状态
+ 	syncStatus status.Syncer
+ 
++	// 同步限流器
+ 	syncRateLimiter flowcontrol.RateLimiter
+ 
+ 	// stopLock is used to enforce that only a single call to Stop send at
+@@ -226,39 +253,57 @@ type NGINXController struct {
+ 	// allowing concurrent stoppers leads to stack traces.
+ 	stopLock *sync.Mutex
+ 
+-	stopCh   chan struct{}
++	stopCh chan struct{}
++
++	// 更新环状channel
+ 	updateCh *channels.RingChannel
+ 
++	// 接受nginx 错误信息channel
+ 	// ngxErrCh is used to detect errors with the NGINX processes
+ 	ngxErrCh chan error
+ 
++	// 当前配置文件
+ 	// runningConfig contains the running configuration in the Backend
+ 	runningConfig *ingress.Configuration
+ 
++	// nginx 配置模板文件
+ 	t ngx_template.Writer
+ 
++	// nameserver 列表
+ 	resolver []net.IP
+ 
++	// 是否启用ipv6
+ 	isIPV6Enabled bool
+ 
++	// 是否关闭
+ 	isShuttingDown bool
+ 
++	// TCP代理
+ 	Proxy *tcpproxy.TCPProxy
+ 
++	// 本地缓存
+ 	store store.Storer
+ 
++	// metrics 收集器
+ 	metricCollector    metric.Collector
+ 	admissionCollector metric.Collector
+ 
++	// webhook
+ 	validationWebhookServer *http.Server
+ 
++	// nginx 二进制命令
+ 	command NginxExecTester
+ }
+ 
+ // Start starts a new NGINX master process running in the foreground.
++// ngx.Start() 主要做3个事情
++// 1. 启动store 协程
++// 2. 启动syncQueue协程
++// 3. 监听updateCh
+ func (n *NGINXController) Start() {
+ 	klog.InfoS("Starting NGINX Ingress controller")
+ 
++	// 初始化同步informers 及secret
+ 	n.store.Run(n.stopCh)
+ 
+ 	// we need to use the defined ingress class to allow multiple leaders
+@@ -266,8 +311,10 @@ func (n *NGINXController) Start() {
+ 	// TODO: For now, as the the IngressClass logics has changed, is up to the
+ 	// cluster admin to create different Leader Election IDs.
+ 	// Should revisit this in a future
++	// 定义节点选举ID
+ 	electionID := n.cfg.ElectionID
+ 
++	// leader节点选举
+ 	setupLeaderElection(&leaderElectionConfig{
+ 		Client:     n.cfg.Client,
+ 		ElectionID: electionID,
+@@ -287,6 +334,7 @@ func (n *NGINXController) Start() {
+ 		},
+ 	})
+ 
++	// 调用nginx -c /etc/nginx/nginx.conf 启动nginx
+ 	cmd := n.command.ExecCommand()
+ 
+ 	// put NGINX in another process group to prevent it
+@@ -300,15 +348,21 @@ func (n *NGINXController) Start() {
+ 		n.setupSSLProxy()
+ 	}
+ 
++	// 启动 nginx
+ 	klog.InfoS("Starting NGINX process")
+ 	n.start(cmd)
+ 
++	// 启动同步队列
+ 	go n.syncQueue.Run(time.Second, n.stopCh)
+ 	// force initial sync
++	// 马上触发工作队列
++	// 为了让controller渲染模板更新后端
++	// 更新的流程唯一入口是工作队列,保证数据一致
+ 	n.syncQueue.EnqueueTask(task.GetDummyObject("initial-sync"))
+ 
+ 	// In case of error the temporal configuration file will
+ 	// be available up to five minutes after the error
++	// 每隔5分钟删除临时配置文件
+ 	go func() {
+ 		for {
+ 			time.Sleep(5 * time.Minute)
+@@ -336,23 +390,29 @@ func (n *NGINXController) Start() {
+ 
+ 			// if the nginx master process dies, the workers continue to process requests
+ 			// until the failure of the configured livenessProbe and restart of the pod.
++			// master 进程挂掉时，workerInc进程将继续处理请求，直到配置的liveness探针探测失败
+ 			if process.IsRespawnIfRequired(err) {
+ 				return
+ 			}
+ 
++		// 循环从updateCh里面获取事件
+ 		case event := <-n.updateCh.Out():
+ 			if n.isShuttingDown {
+ 				break
+ 			}
+ 
++			// 主循环很简单，就是将时间类型是 store.ConfigurationEvent 的事件放入队列时标记为不可跳过
++			// 反之，可跳过
+ 			if evt, ok := event.(store.Event); ok {
+ 				klog.V(3).InfoS("Event received", "type", evt.Type, "object", evt.Obj)
+ 				if evt.Type == store.ConfigurationEvent {
+ 					// TODO: is this necessary? Consider removing this special case
++					// Configuration事件通知
+ 					n.syncQueue.EnqueueTask(task.GetDummyObject("configmap-change"))
+ 					continue
+ 				}
+ 
++				// 放入可忽略的同步队列
+ 				n.syncQueue.EnqueueSkippableTask(evt.Obj)
+ 			} else {
+ 				klog.Warningf("Unexpected event type received %T", event)
+@@ -658,10 +718,13 @@ Error: %v
+ // changes were detected. The received backend Configuration is merged with the
+ // configuration ConfigMap before generating the final configuration file.
+ // Returns nil in case the backend was successfully reloaded.
++// 当监听到配置发生变化，同步循环将调用OnUdate
++// 接收到的backend 配置会跟当前配置的configmap 进行合并
+ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
+ 	cfg := n.store.GetBackendConfiguration()
+ 	cfg.Resolver = n.resolver
+ 
++	// 生成临时配置
+ 	content, err := n.generateTemplate(cfg, ingressCfg)
+ 	if err != nil {
+ 		return err
+@@ -672,6 +735,7 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
+ 		return err
+ 	}
+ 
++	// 检查配置是否正确
+ 	err = n.testTemplate(content)
+ 	if err != nil {
+ 		return err
+@@ -685,11 +749,13 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
+ 				return err
+ 			}
+ 			defer tmpfile.Close()
++			// 创建临时配置文件
+ 			err = os.WriteFile(tmpfile.Name(), content, file.ReadWriteByUser)
+ 			if err != nil {
+ 				return err
+ 			}
+ 
++			// diff 比对生成的临时配置跟当前生效配置
+ 			diffOutput, err := exec.Command("diff", "-I", "'# Configuration.*'", "-u", cfgPath, tmpfile.Name()).CombinedOutput()
+ 			if err != nil {
+ 				if exitError, ok := err.(*exec.ExitError); ok {
+@@ -704,10 +770,12 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
+ 
+ 			// we do not defer the deletion of temp files in order
+ 			// to keep them around for inspection in case of error
++			// 删除临时配置文件
+ 			os.Remove(tmpfile.Name())
+ 		}
+ 	}
+ 
++	// 将新配置写入cfgPath
+ 	err = os.WriteFile(cfgPath, content, file.ReadWriteByUser)
+ 	if err != nil {
+ 		return err
+@@ -834,15 +902,20 @@ func clearL4serviceEndpoints(config *ingress.Configuration) {
+ 
+ // configureDynamically encodes new Backends in JSON format and POSTs the
+ // payload to an internal HTTP endpoint handled by Lua.
++// 以json 的格式封装backend 列表并post 到lua API
+ func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) error {
++	// 比对 backend 是否变化
+ 	backendsChanged := !reflect.DeepEqual(n.runningConfig.Backends, pcfg.Backends)
++	// 如果 backend 发生变化，post 推送给 /configuration/backends 接口
+ 	if backendsChanged {
++		// 更新endpoint 列表
+ 		err := configureBackends(pcfg.Backends)
+ 		if err != nil {
+ 			return err
+ 		}
+ 	}
+ 
++	// 比对TCP/UDP endpoint 列表
+ 	streamConfigurationChanged := !reflect.DeepEqual(n.runningConfig.TCPEndpoints, pcfg.TCPEndpoints) || !reflect.DeepEqual(n.runningConfig.UDPEndpoints, pcfg.UDPEndpoints)
+ 	if streamConfigurationChanged {
+ 		err := updateStreamConfiguration(pcfg.TCPEndpoints, pcfg.UDPEndpoints)
+@@ -851,6 +924,7 @@ func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) erro
+ 		}
+ 	}
+ 
++	// 比对servers 变化
+ 	serversChanged := !reflect.DeepEqual(n.runningConfig.Servers, pcfg.Servers)
+ 	if serversChanged {
+ 		err := configureCertificates(pcfg.Servers)
+@@ -917,6 +991,7 @@ func updateStreamConfiguration(TCPEndpoints []ingress.L4Service, UDPEndpoints []
+ 	return nil
+ }
+ 
++// 以JSON 格式 POST 调用LUA Handler /configuration/backends
+ func configureBackends(rawBackends []*ingress.Backend) error {
+ 	backends := make([]*ingress.Backend, len(rawBackends))
+ 
+@@ -950,6 +1025,7 @@ func configureBackends(rawBackends []*ingress.Backend) error {
+ 		backends[i] = luaBackend
+ 	}
+ 
++	// 将 backend 列表以json格式post 到 /configuration/backends 这个LUA Handler，动态更新endpoint 列表
+ 	statusCode, _, err := nginx.NewPostStatusRequest("/configuration/backends", "application/json", backends)
+ 	if err != nil {
+ 		return err
+@@ -969,6 +1045,7 @@ type sslConfiguration struct {
+ 
+ // configureCertificates JSON encodes certificates and POSTs it to an internal HTTP endpoint
+ // that is handled by Lua
++// 动态更新证书
+ func configureCertificates(rawServers []*ingress.Server) error {
+ 	configuration := &sslConfiguration{
+ 		Certificates: map[string]string{},
+@@ -1055,6 +1132,7 @@ const datadogTmpl = `{
+   "dd.priority.sampling": {{ .DatadogPrioritySampling }}
+ }`
+ 
++// 创建 Opentracing 配置
+ func createOpentracingCfg(cfg ngx_config.Configuration) error {
+ 	var tmpl *template.Template
+ 	var err error
+diff --git a/internal/ingress/controller/store/store.go b/internal/ingress/controller/store/store.go
+index 239fbaaf5..2fe75921d 100644
+--- a/internal/ingress/controller/store/store.go
++++ b/internal/ingress/controller/store/store.go
+@@ -240,6 +240,7 @@ type k8sStore struct {
+ 	defaultSSLCertificate string
+ }
+ 
++// Store的New方法
+ // New creates a new object store to be used in the ingress controller
+ func New(
+ 	namespace string,
+@@ -252,6 +253,7 @@ func New(
+ 	deepInspector bool,
+ 	icConfig *ingressclass.IngressClassConfiguration) Storer {
+ 
++	// store的具体实现是k8sStore
+ 	store := &k8sStore{
+ 		informers:             &Informer{},
+ 		listers:               &Lister{},
+@@ -264,6 +266,7 @@ func New(
+ 		defaultSSLCertificate: defaultSSLCertificate,
+ 	}
+ 
++	//  kubectl describe 命令看到的事件日志就是这个库产生的
+ 	eventBroadcaster := record.NewBroadcaster()
+ 	eventBroadcaster.StartLogging(klog.Infof)
+ 	eventBroadcaster.StartRecordingToSink(&clientcorev1.EventSinkImpl{
+@@ -273,9 +276,13 @@ func New(
+ 		Component: "nginx-ingress-controller",
+ 	})
+ 
++	// 用于提取注释的对象
++	// 集中在internal/ingress/annotations目录
+ 	// k8sStore fulfills resolver.Resolver interface
+ 	store.annotations = annotations.NewAnnotationExtractor(store)
+ 
++	// 将数据再缓存一份用于本地查询，缓存的对象正如其名IngressWithAnnotation
++	// 会缓存internal/ingress/types.go:Ingress
+ 	store.listers.IngressWithAnnotation.Store = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
+ 
+ 	// As we currently do not filter out kubernetes objects we list, we can
+@@ -305,11 +312,13 @@ func New(
+ 		}
+ 	}
+ 
++	// 创建informer工厂函数
+ 	// create informers factory, enable and assign required informers
+ 	infFactory := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
+ 		informers.WithNamespace(namespace),
+ 	)
+ 
++	// infFactoryConfigmaps, infFactorySecrets
+ 	// create informers factory for configmaps
+ 	infFactoryConfigmaps := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
+ 		informers.WithNamespace(namespace),
+@@ -341,7 +350,9 @@ func New(
+ 
+ 	store.informers.Service = infFactory.Core().V1().Services().Informer()
+ 	store.listers.Service.Store = store.informers.Service.GetStore()
++	// 上面都是为了创建对应的informer对象，以及informer的缓存对象listers，用来查询最新数据
+ 
++	// 默认监听整个集群，返回true
+ 	// avoid caching namespaces at cluster scope when watching single namespace
+ 	if namespaceSelector != nil && !namespaceSelector.Empty() {
+ 		// cache informers factory for namespaces
+@@ -791,6 +802,11 @@ func New(
+ 			}
+ 		},
+ 	}
++	// 以上都是各种事件监听函数, 分别设置对应事件的响应函数,一共有三个需要响应AddFunc,DeleteFunc,UpdateFunc.
++	// 而成功之后的逻辑一般分为三步
++	// 1. 业务逻辑
++	// 2. 同步数据到本地(如syncIngress, syncSecrets等)
++	// 3. 将数据传递给传递给updateCh, 即交由controller的主循环。
+ 
+ 	store.informers.Ingress.AddEventHandler(ingEventHandler)
+ 	if !icConfig.IgnoreIngressClass {
+@@ -801,6 +817,7 @@ func New(
+ 	store.informers.ConfigMap.AddEventHandler(cmEventHandler)
+ 	store.informers.Service.AddEventHandler(serviceHandler)
+ 
++	// 在提供的helm charts里面会创建一个默认的configmap, 在这里就马上读取
+ 	// do not wait for informers to read the configmap configuration
+ 	ns, name, _ := k8s.ParseNameNS(configmap)
+ 	cm, err := client.CoreV1().ConfigMaps(ns).Get(context.TODO(), name, metav1.GetOptions{})
+@@ -839,6 +856,8 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
+ 	key := k8s.MetaNamespaceKey(ing)
+ 	klog.V(3).Infof("updating annotations information for ingress %v", key)
+ 
++	// k8s的controller模式，一个很重要的范式就是，不要直接修改informer传递过来的对象
++	// 因为这个对象可能被多个controller引用，所以才叫共享的informer嘛(SharedInformer)
+ 	copyIng := &networkingv1.Ingress{}
+ 	ing.ObjectMeta.DeepCopyInto(&copyIng.ObjectMeta)
+ 
+@@ -852,6 +871,7 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
+ 	ing.Spec.DeepCopyInto(&copyIng.Spec)
+ 	ing.Status.DeepCopyInto(&copyIng.Status)
+ 
++	// 处理一些ingress的rules
+ 	for ri, rule := range copyIng.Spec.Rules {
+ 		if rule.HTTP == nil {
+ 			continue
+@@ -866,6 +886,8 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
+ 
+ 	k8s.SetDefaultNGINXPathType(copyIng)
+ 
++	// 将数据更新到 IngressWithAnnotation
++	// 这个 ingress 是带注释的，即 ParsedAnnotations 字段
+ 	err := s.listers.IngressWithAnnotation.Update(&ingress.Ingress{
+ 		Ingress:           *copyIng,
+ 		ParsedAnnotations: s.annotations.Extract(ing),
+@@ -1131,6 +1153,7 @@ func (s *k8sStore) setConfig(cmap *corev1.ConfigMap) {
+ // synchronization of the secrets.
+ func (s *k8sStore) Run(stopCh chan struct{}) {
+ 	// start informers
++	// 启动之前创建的所有informer
+ 	s.informers.Run(stopCh)
+ }
+ 
+diff --git a/internal/ingress/controller/template/template.go b/internal/ingress/controller/template/template.go
+index 8d4cb6e75..d171ca003 100644
+--- a/internal/ingress/controller/template/template.go
++++ b/internal/ingress/controller/template/template.go
+@@ -83,11 +83,13 @@ func NewTemplate(file string) (*Template, error) {
+ 		return nil, fmt.Errorf("unexpected error reading template %s: %w", file, err)
+ 	}
+ 
++	// 解析模板文件，添加自定义函数 funcMap
+ 	tmpl, err := text_template.New("nginx.tmpl").Funcs(funcMap).Parse(string(data))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
++	// 返回模板渲染后内容
+ 	return &Template{
+ 		tmpl: tmpl,
+ 		bp:   NewBufferPool(defBufferSize),
+@@ -212,6 +214,7 @@ func (t *Template) Write(conf config.TemplateConfig) ([]byte, error) {
+ 	return res, nil
+ }
+ 
++// 模板文件自定义方法
+ var (
+ 	funcMap = text_template.FuncMap{
+ 		"empty": func(input interface{}) bool {
+diff --git a/internal/task/queue.go b/internal/task/queue.go
+index ff6b20f62..6afcaf77e 100644
+--- a/internal/task/queue.go
++++ b/internal/task/queue.go
+@@ -57,6 +57,7 @@ type Element struct {
+ }
+ 
+ // Run starts processing elements in the queue
++// 启动队列
+ func (t *Queue) Run(period time.Duration, stopCh <-chan struct{}) {
+ 	wait.Until(t.worker, period, stopCh)
+ }
+@@ -82,6 +83,7 @@ func (t *Queue) enqueue(obj interface{}, skippable bool) {
+ 	ts := time.Now().UnixNano()
+ 	if !skippable {
+ 		// make sure the timestamp is bigger than lastSync
++		// 如果队列标记为不可跳过, 它的时间戳Timestamp会加上24小时
+ 		ts = time.Now().Add(24 * time.Hour).UnixNano()
+ 	}
+ 	klog.V(3).InfoS("queuing", "item", obj)
+@@ -106,6 +108,7 @@ func (t *Queue) defaultKeyFunc(obj interface{}) (interface{}, error) {
+ }
+ 
+ // worker processes work in the queue through sync.
++// 消费Queue队列
+ func (t *Queue) worker() {
+ 	for {
+ 		key, quit := t.queue.Get()
+@@ -118,6 +121,9 @@ func (t *Queue) worker() {
+ 		ts := time.Now().UnixNano()
+ 
+ 		item := key.(Element)
++		// 比对最后一次同步的时间戳与Queue中取出item里面带的时间戳，如果小于最后一次同步时间戳则忽略改变更
++		// 如果是EnqueueTask方法入栈标记为不可跳过时时，它的时间戳Timestamp已经加上24小时
++		// 也就是说二十四小时以内不会被跳过
+ 		if item.Timestamp != 0 && t.lastSync > item.Timestamp {
+ 			klog.V(3).InfoS("skipping sync", "key", item.Key, "last", t.lastSync, "now", item.Timestamp)
+ 			t.queue.Forget(key)
+@@ -126,6 +132,7 @@ func (t *Queue) worker() {
+ 		}
+ 
+ 		klog.V(3).InfoS("syncing", "key", item.Key)
++		// 这里的sync就是之前传入的n.syncIngress
+ 		if err := t.sync(key); err != nil {
+ 			klog.ErrorS(err, "requeuing", "key", item.Key)
+ 			t.queue.AddRateLimited(Element{
+@@ -164,12 +171,14 @@ func (t *Queue) IsShuttingDown() bool {
+ 
+ // NewTaskQueue creates a new task queue with the given sync function.
+ // The sync function is called for every element inserted into the queue.
++// 对于每个插入进来的项目都会调用sync function
+ func NewTaskQueue(syncFn func(interface{}) error) *Queue {
+ 	return NewCustomTaskQueue(syncFn, nil)
+ }
+ 
+ // NewCustomTaskQueue ...
+ func NewCustomTaskQueue(syncFn func(interface{}) error, fn func(interface{}) (interface{}, error)) *Queue {
++	// syncFn(也就是syncIngress)被赋值到Queue.sync
+ 	q := &Queue{
+ 		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+ 		sync:       syncFn,
+diff --git a/pkg/util/ingress/ingress.go b/pkg/util/ingress/ingress.go
+index 7df2cc114..2c5d69f19 100644
+--- a/pkg/util/ingress/ingress.go
++++ b/pkg/util/ingress/ingress.go
+@@ -114,10 +114,13 @@ func GetRemovedIngresses(rucfg, newcfg *ingress.Configuration) []string {
+ 
+ // IsDynamicConfigurationEnough returns whether a Configuration can be
+ // dynamically applied, without reloading the backend.
++// 判断是否nginx 可以动态重载，不需要执行reload
+ func IsDynamicConfigurationEnough(newcfg *ingress.Configuration, oldcfg *ingress.Configuration) bool {
+ 	copyOfRunningConfig := *oldcfg
+ 	copyOfPcfg := *newcfg
+ 
++	// 可以看到，在比较配置文件的时候，backend字段会设置为空
++	// 所以只是backend字段更新不会触发reload
+ 	copyOfRunningConfig.Backends = []*ingress.Backend{}
+ 	copyOfPcfg.Backends = []*ingress.Backend{}
+ 
+diff --git a/rootfs/etc/nginx/template/nginx.tmpl b/rootfs/etc/nginx/template/nginx.tmpl
+index a04f71f0e..41fad2d85 100755
+--- a/rootfs/etc/nginx/template/nginx.tmpl
++++ b/rootfs/etc/nginx/template/nginx.tmpl
+@@ -709,11 +709,12 @@ http {
+                 ngx.exit(ngx.HTTP_OK)
+             }
+         }
+-
++        # /nginx_status
++        # 用来暴露nginx状态给controller来统计数据
+         location {{ .StatusPath }} {
+             stub_status on;
+         }
+-
++        // 动态后端的接口
+         location /configuration {
+             client_max_body_size                    {{ luaConfigurationRequestBodySize $cfg }};
+             client_body_buffer_size                 {{ luaConfigurationRequestBodySize $cfg }};
+@@ -788,7 +789,8 @@ stream {
+     set_real_ip_from    {{ $trusted_ip }};
+     {{ end }}
+     {{ end }}
+-
++    
++    # 这里只创建了一个upstream,所有流量交给balancer.balance()方法
+     upstream upstream_balancer {
+         server 0.0.0.1:1234; # placeholder
+ 

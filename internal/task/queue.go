@@ -57,6 +57,7 @@ type Element struct {
 }
 
 // Run starts processing elements in the queue
+// 启动队列
 func (t *Queue) Run(period time.Duration, stopCh <-chan struct{}) {
 	wait.Until(t.worker, period, stopCh)
 }
@@ -82,6 +83,7 @@ func (t *Queue) enqueue(obj interface{}, skippable bool) {
 	ts := time.Now().UnixNano()
 	if !skippable {
 		// make sure the timestamp is bigger than lastSync
+		// 如果队列标记为不可跳过, 它的时间戳Timestamp会加上24小时
 		ts = time.Now().Add(24 * time.Hour).UnixNano()
 	}
 	klog.V(3).InfoS("queuing", "item", obj)
@@ -106,6 +108,7 @@ func (t *Queue) defaultKeyFunc(obj interface{}) (interface{}, error) {
 }
 
 // worker processes work in the queue through sync.
+// 消费Queue队列
 func (t *Queue) worker() {
 	for {
 		key, quit := t.queue.Get()
@@ -118,6 +121,9 @@ func (t *Queue) worker() {
 		ts := time.Now().UnixNano()
 
 		item := key.(Element)
+		// 比对最后一次同步的时间戳与Queue中取出item里面带的时间戳，如果小于最后一次同步时间戳则忽略改变更
+		// 如果是EnqueueTask方法入栈标记为不可跳过时时，它的时间戳Timestamp已经加上24小时
+		// 也就是说二十四小时以内不会被跳过
 		if item.Timestamp != 0 && t.lastSync > item.Timestamp {
 			klog.V(3).InfoS("skipping sync", "key", item.Key, "last", t.lastSync, "now", item.Timestamp)
 			t.queue.Forget(key)
@@ -126,6 +132,7 @@ func (t *Queue) worker() {
 		}
 
 		klog.V(3).InfoS("syncing", "key", item.Key)
+		// 这里的sync就是之前传入的n.syncIngress
 		if err := t.sync(key); err != nil {
 			klog.ErrorS(err, "requeuing", "key", item.Key)
 			t.queue.AddRateLimited(Element{
@@ -164,12 +171,14 @@ func (t *Queue) IsShuttingDown() bool {
 
 // NewTaskQueue creates a new task queue with the given sync function.
 // The sync function is called for every element inserted into the queue.
+// 对于每个插入进来的项目都会调用sync function
 func NewTaskQueue(syncFn func(interface{}) error) *Queue {
 	return NewCustomTaskQueue(syncFn, nil)
 }
 
 // NewCustomTaskQueue ...
 func NewCustomTaskQueue(syncFn func(interface{}) error, fn func(interface{}) (interface{}, error)) *Queue {
+	// syncFn(也就是syncIngress)被赋值到Queue.sync
 	q := &Queue{
 		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 		sync:       syncFn,

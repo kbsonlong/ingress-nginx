@@ -72,17 +72,20 @@ const (
 
 // NewNGINXController creates a new NGINX Ingress controller.
 func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXController {
+	// kubectl describe 命令看到的事件日志就是这个库产生的
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{
 		Interface: config.Client.CoreV1().Events(config.Namespace),
 	})
 
+	// 读取pod里面的/etc/resolv.conf
 	h, err := dns.GetSystemNameServers()
 	if err != nil {
 		klog.Warningf("Error reading system nameservers: %v", err)
 	}
 
+	// 实例化 NGINXController
 	n := &NGINXController{
 		isIPV6Enabled: ing_net.IsIPv6Enabled(),
 
@@ -101,15 +104,18 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 
 		stopLock: &sync.Mutex{},
 
+		// 当前运行的配置文件，刚启动是为空
 		runningConfig: new(ingress.Configuration),
 
 		Proxy: &tcpproxy.TCPProxy{},
 
 		metricCollector: mc,
 
+		// 一个可以调用 nginx -c nginx.conf 命令的对象
 		command: NewNginxCommand(),
 	}
 
+	// 启动 webhook 服务
 	if n.cfg.ValidationWebhook != "" {
 		n.validationWebhookServer = &http.Server{
 			Addr: config.ValidationWebhook,
@@ -124,6 +130,8 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		}
 	}
 
+	// 实例化 store (本地缓存)
+	// store 对象，很重要，数据缓存与k8s交互的接口都在这个对象
 	n.store = store.New(
 		config.Namespace,
 		config.WatchNamespaceSelector,
@@ -138,6 +146,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		config.DeepInspector,
 		config.IngressClassConfiguration)
 
+	// 创建工作队列，这里把 syncIngress 注册到这个工作队列
 	n.syncQueue = task.NewTaskQueue(n.syncIngress)
 
 	if config.UpdateStatus {
@@ -153,7 +162,9 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		klog.Warning("Update of Ingress status is disabled (flag --update-status)")
 	}
 
+	// 监听模板文件更新
 	onTemplateChange := func() {
+		// 渲染模板
 		template, err := ngx_template.NewTemplate(nginx.TemplatePath)
 		if err != nil {
 			// this error is different from the rest because it must be clear why nginx is not working
@@ -161,17 +172,22 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 			return
 		}
 
+		// 若模板渲染正确，则更新到 nginxcontroller 对象中，并往同步队列发送一个 template-change 事件
 		n.t = template
 		klog.InfoS("New NGINX configuration template loaded")
 		n.syncQueue.EnqueueTask(task.GetDummyObject("template-change"))
 	}
 
+	// 首次启动加载配置模板文件
 	ngxTpl, err := ngx_template.NewTemplate(nginx.TemplatePath)
 	if err != nil {
 		klog.Fatalf("Invalid NGINX configuration template: %v", err)
 	}
 
 	n.t = ngxTpl
+
+	// 监听模板文件变化
+	// 监听 /etc/nginx/template/nginx.tmpl 模板文件是否有变化，有变化则调用 onTemplateChange
 
 	_, err = file.NewFileWatcher(nginx.TemplatePath, onTemplateChange)
 	if err != nil {
@@ -196,6 +212,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		klog.Fatalf("Error creating file watchers: %v", err)
 	}
 
+	// 配置文件有变化则往同步队列发送一个 file-change 事件
 	for _, f := range filesToWatch {
 		_, err = file.NewFileWatcher(f, func() {
 			klog.InfoS("File changed detected. Reloading NGINX", "path", f)
@@ -209,16 +226,26 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	return n
 }
 
+// NGINXController对象并不直接与集群打交道，
+// 而是通过将交互接口全部抽象到store对象，ingress, configmap, service等资源的事件响应也全部放在store里面，
+// store负责判断对象是否应该传递给NGINXController的主循环, 然后将数据缓存到本地, 以便后面让NGINXController对象查询，
+// NGINXController对象主要负责怎么将资源的变更同步给nginx，比如怎么渲染模板，是否动态更新数据给nginx。
+
 // NGINXController describes a NGINX Ingress controller.
 type NGINXController struct {
+	// 配置信息
 	cfg *Configuration
 
+	// 事件通知器
 	recorder record.EventRecorder
 
+	// 同步队列
 	syncQueue *task.Queue
 
+	// 同步状态
 	syncStatus status.Syncer
 
+	// 同步限流器
 	syncRateLimiter flowcontrol.RateLimiter
 
 	// stopLock is used to enforce that only a single call to Stop send at
@@ -226,39 +253,57 @@ type NGINXController struct {
 	// allowing concurrent stoppers leads to stack traces.
 	stopLock *sync.Mutex
 
-	stopCh   chan struct{}
+	stopCh chan struct{}
+
+	// 更新环状channel
 	updateCh *channels.RingChannel
 
+	// 接受nginx 错误信息channel
 	// ngxErrCh is used to detect errors with the NGINX processes
 	ngxErrCh chan error
 
+	// 当前配置文件
 	// runningConfig contains the running configuration in the Backend
 	runningConfig *ingress.Configuration
 
+	// nginx 配置模板文件
 	t ngx_template.Writer
 
+	// nameserver 列表
 	resolver []net.IP
 
+	// 是否启用ipv6
 	isIPV6Enabled bool
 
+	// 是否关闭
 	isShuttingDown bool
 
+	// TCP代理
 	Proxy *tcpproxy.TCPProxy
 
+	// 本地缓存
 	store store.Storer
 
+	// metrics 收集器
 	metricCollector    metric.Collector
 	admissionCollector metric.Collector
 
+	// webhook
 	validationWebhookServer *http.Server
 
+	// nginx 二进制命令
 	command NginxExecTester
 }
 
 // Start starts a new NGINX master process running in the foreground.
+// ngx.Start() 主要做3个事情
+// 1. 启动store 协程
+// 2. 启动syncQueue协程
+// 3. 监听updateCh
 func (n *NGINXController) Start() {
 	klog.InfoS("Starting NGINX Ingress controller")
 
+	// 初始化同步informers 及secret
 	n.store.Run(n.stopCh)
 
 	// we need to use the defined ingress class to allow multiple leaders
@@ -266,8 +311,10 @@ func (n *NGINXController) Start() {
 	// TODO: For now, as the the IngressClass logics has changed, is up to the
 	// cluster admin to create different Leader Election IDs.
 	// Should revisit this in a future
+	// 定义节点选举ID
 	electionID := n.cfg.ElectionID
 
+	// leader节点选举
 	setupLeaderElection(&leaderElectionConfig{
 		Client:     n.cfg.Client,
 		ElectionID: electionID,
@@ -287,6 +334,7 @@ func (n *NGINXController) Start() {
 		},
 	})
 
+	// 调用nginx -c /etc/nginx/nginx.conf 启动nginx
 	cmd := n.command.ExecCommand()
 
 	// put NGINX in another process group to prevent it
@@ -300,15 +348,21 @@ func (n *NGINXController) Start() {
 		n.setupSSLProxy()
 	}
 
+	// 启动 nginx
 	klog.InfoS("Starting NGINX process")
 	n.start(cmd)
 
+	// 启动同步队列
 	go n.syncQueue.Run(time.Second, n.stopCh)
 	// force initial sync
+	// 马上触发工作队列
+	// 为了让controller渲染模板更新后端
+	// 更新的流程唯一入口是工作队列,保证数据一致
 	n.syncQueue.EnqueueTask(task.GetDummyObject("initial-sync"))
 
 	// In case of error the temporal configuration file will
 	// be available up to five minutes after the error
+	// 每隔5分钟删除临时配置文件
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
@@ -336,23 +390,29 @@ func (n *NGINXController) Start() {
 
 			// if the nginx master process dies, the workers continue to process requests
 			// until the failure of the configured livenessProbe and restart of the pod.
+			// master 进程挂掉时，workerInc进程将继续处理请求，直到配置的liveness探针探测失败
 			if process.IsRespawnIfRequired(err) {
 				return
 			}
 
+		// 循环从updateCh里面获取事件
 		case event := <-n.updateCh.Out():
 			if n.isShuttingDown {
 				break
 			}
 
+			// 主循环很简单，就是将时间类型是 store.ConfigurationEvent 的事件放入队列时标记为不可跳过
+			// 反之，可跳过
 			if evt, ok := event.(store.Event); ok {
 				klog.V(3).InfoS("Event received", "type", evt.Type, "object", evt.Obj)
 				if evt.Type == store.ConfigurationEvent {
 					// TODO: is this necessary? Consider removing this special case
+					// Configuration事件通知
 					n.syncQueue.EnqueueTask(task.GetDummyObject("configmap-change"))
 					continue
 				}
 
+				// 放入可忽略的同步队列
 				n.syncQueue.EnqueueSkippableTask(evt.Obj)
 			} else {
 				klog.Warningf("Unexpected event type received %T", event)
@@ -658,10 +718,13 @@ Error: %v
 // changes were detected. The received backend Configuration is merged with the
 // configuration ConfigMap before generating the final configuration file.
 // Returns nil in case the backend was successfully reloaded.
+// 当监听到配置发生变化，同步循环将调用OnUdate
+// 接收到的backend 配置会跟当前配置的configmap 进行合并
 func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 	cfg := n.store.GetBackendConfiguration()
 	cfg.Resolver = n.resolver
 
+	// 生成临时配置
 	content, err := n.generateTemplate(cfg, ingressCfg)
 	if err != nil {
 		return err
@@ -672,6 +735,7 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 		return err
 	}
 
+	// 检查配置是否正确
 	err = n.testTemplate(content)
 	if err != nil {
 		return err
@@ -685,11 +749,13 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 				return err
 			}
 			defer tmpfile.Close()
+			// 创建临时配置文件
 			err = os.WriteFile(tmpfile.Name(), content, file.ReadWriteByUser)
 			if err != nil {
 				return err
 			}
 
+			// diff 比对生成的临时配置跟当前生效配置
 			diffOutput, err := exec.Command("diff", "-I", "'# Configuration.*'", "-u", cfgPath, tmpfile.Name()).CombinedOutput()
 			if err != nil {
 				if exitError, ok := err.(*exec.ExitError); ok {
@@ -704,10 +770,12 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 
 			// we do not defer the deletion of temp files in order
 			// to keep them around for inspection in case of error
+			// 删除临时配置文件
 			os.Remove(tmpfile.Name())
 		}
 	}
 
+	// 将新配置写入cfgPath
 	err = os.WriteFile(cfgPath, content, file.ReadWriteByUser)
 	if err != nil {
 		return err
@@ -834,15 +902,20 @@ func clearL4serviceEndpoints(config *ingress.Configuration) {
 
 // configureDynamically encodes new Backends in JSON format and POSTs the
 // payload to an internal HTTP endpoint handled by Lua.
+// 以json 的格式封装backend 列表并post 到lua API
 func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) error {
+	// 比对 backend 是否变化
 	backendsChanged := !reflect.DeepEqual(n.runningConfig.Backends, pcfg.Backends)
+	// 如果 backend 发生变化，post 推送给 /configuration/backends 接口
 	if backendsChanged {
+		// 更新endpoint 列表
 		err := configureBackends(pcfg.Backends)
 		if err != nil {
 			return err
 		}
 	}
 
+	// 比对TCP/UDP endpoint 列表
 	streamConfigurationChanged := !reflect.DeepEqual(n.runningConfig.TCPEndpoints, pcfg.TCPEndpoints) || !reflect.DeepEqual(n.runningConfig.UDPEndpoints, pcfg.UDPEndpoints)
 	if streamConfigurationChanged {
 		err := updateStreamConfiguration(pcfg.TCPEndpoints, pcfg.UDPEndpoints)
@@ -851,6 +924,7 @@ func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) erro
 		}
 	}
 
+	// 比对servers 变化
 	serversChanged := !reflect.DeepEqual(n.runningConfig.Servers, pcfg.Servers)
 	if serversChanged {
 		err := configureCertificates(pcfg.Servers)
@@ -917,6 +991,7 @@ func updateStreamConfiguration(TCPEndpoints []ingress.L4Service, UDPEndpoints []
 	return nil
 }
 
+// 以JSON 格式 POST 调用LUA Handler /configuration/backends
 func configureBackends(rawBackends []*ingress.Backend) error {
 	backends := make([]*ingress.Backend, len(rawBackends))
 
@@ -950,6 +1025,7 @@ func configureBackends(rawBackends []*ingress.Backend) error {
 		backends[i] = luaBackend
 	}
 
+	// 将 backend 列表以json格式post 到 /configuration/backends 这个LUA Handler，动态更新endpoint 列表
 	statusCode, _, err := nginx.NewPostStatusRequest("/configuration/backends", "application/json", backends)
 	if err != nil {
 		return err
@@ -969,6 +1045,7 @@ type sslConfiguration struct {
 
 // configureCertificates JSON encodes certificates and POSTs it to an internal HTTP endpoint
 // that is handled by Lua
+// 动态更新证书
 func configureCertificates(rawServers []*ingress.Server) error {
 	configuration := &sslConfiguration{
 		Certificates: map[string]string{},
@@ -1055,6 +1132,7 @@ const datadogTmpl = `{
   "dd.priority.sampling": {{ .DatadogPrioritySampling }}
 }`
 
+// 创建 Opentracing 配置
 func createOpentracingCfg(cfg ngx_config.Configuration) error {
 	var tmpl *template.Template
 	var err error

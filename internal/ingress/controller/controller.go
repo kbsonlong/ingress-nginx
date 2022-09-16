@@ -144,19 +144,28 @@ func (n NGINXController) GetPublishService() *apiv1.Service {
 // syncIngress collects all the pieces required to assemble the NGINX
 // configuration file and passes the resulting data structures to the backend
 // (OnUpdate) when a reload is deemed necessary.
+// 同步Ingress
 func (n *NGINXController) syncIngress(interface{}) error {
+	// 同步队列限流器
 	n.syncRateLimiter.Accept()
 
 	if n.syncQueue.IsShuttingDown() {
 		return nil
 	}
 
+	// 获取最所有的ingress对象, 这个ingress对象是有ParsedAnnotations字段的
 	ings := n.store.ListIngresses()
+	// 通过getConfiguration方法将ingress分为hosts,servers，pcfg三个部分
+	// host是ingress定义的域名
+	// servers对应nginx里的每个server指令所需的数据, 每个域名会创建一个server {server_name xxx; ....}的配置
+	// pcfg是后面用来渲染nginx的模板
 	hosts, servers, pcfg := n.getConfiguration(ings)
 
 	n.metricCollector.SetSSLExpireTime(servers)
 	n.metricCollector.SetSSLInfo(servers)
 
+	// 判断当前配置与集群中的数据是否一致
+	// controller刚启动的时候runningConfig为空，所以首次触发就会更新模板
 	if n.runningConfig.Equal(pcfg) {
 		klog.V(3).Infof("No configuration change detected, skipping backend reload")
 		return nil
@@ -164,15 +173,19 @@ func (n *NGINXController) syncIngress(interface{}) error {
 
 	n.metricCollector.SetHosts(hosts)
 
+	// 判断是否有必要重新渲染模板并执行nginx -s reload
+	// 如果只是backend更新，不会重新渲染模板的
 	if !utilingress.IsDynamicConfigurationEnough(pcfg, n.runningConfig) {
 		klog.InfoS("Configuration changes detected, backend reload required")
 
+		// 生成checksum hash值
 		hash, _ := hashstructure.Hash(pcfg, &hashstructure.HashOptions{
 			TagName: "json",
 		})
 
 		pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
 
+		// 当监听到配置发生变化，同步循环将调用OnUdate
 		err := n.OnUpdate(*pcfg)
 		if err != nil {
 			n.metricCollector.IncReloadErrorCount()
@@ -189,6 +202,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		n.recorder.Eventf(k8s.IngressPodDetails, apiv1.EventTypeNormal, "RELOAD", "NGINX reload triggered due to a change in configuration")
 	}
 
+	// 如果是第一次启动，等待一秒，让nginx有时间监听端口以便后续的动态更新
 	isFirstSync := n.runningConfig.Equal(&ingress.Configuration{})
 	if isFirstSync {
 		// For the initial sync it always takes some time for NGINX to start listening
@@ -197,6 +211,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		time.Sleep(1 * time.Second)
 	}
 
+	// 重试机制
 	retry := wait.Backoff{
 		Steps:    1 + n.cfg.DynamicConfigurationRetries,
 		Duration: time.Second,
@@ -205,7 +220,10 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	}
 
 	retriesRemaining := retry.Steps
+	// 这里可以看到，无论数据是否更新都会调用configureDynamically
+	// configureDynamically 会判断是否有必要更新后端
 	err := wait.ExponentialBackoff(retry, func() (bool, error) {
+		// 动态更新 nginx 配置
 		err := n.configureDynamically(pcfg)
 		if err == nil {
 			klog.V(2).Infof("Dynamic reconfiguration succeeded.")
@@ -224,6 +242,7 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		return err
 	}
 
+	// 更新指标数据
 	ri := utilingress.GetRemovedIngresses(n.runningConfig, pcfg)
 	re := utilingress.GetRemovedHosts(n.runningConfig, pcfg)
 	rc := utilingress.GetRemovedCertificateSerialNumbers(n.runningConfig, pcfg)
@@ -233,6 +252,12 @@ func (n *NGINXController) syncIngress(interface{}) error {
 
 	return nil
 }
+
+// syncIngress 方法总结
+// k8s集群里监听的资源(ingress, configmap, service, endpoint等)发生变化之后就会触发syncIngress方法，
+// syncIngress方法会比对当前的配置与集群的配置是否一致，如果一致就跳过，如果不一致就判断是否只要动态更新，
+// 如果动态更新不能满足要求就重新生成配置文件并执行命令 nginx -s reload,
+// 最后判断是否需要动态更新，如果需要就发送POST请求到nginx执行动态更新。
 
 // CheckIngress returns an error in case the provided ingress, when added
 // to the current configuration, generates an invalid configuration

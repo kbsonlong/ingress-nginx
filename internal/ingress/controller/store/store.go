@@ -240,6 +240,7 @@ type k8sStore struct {
 	defaultSSLCertificate string
 }
 
+// Store的New方法
 // New creates a new object store to be used in the ingress controller
 func New(
 	namespace string,
@@ -252,6 +253,7 @@ func New(
 	deepInspector bool,
 	icConfig *ingressclass.IngressClassConfiguration) Storer {
 
+	// store的具体实现是k8sStore
 	store := &k8sStore{
 		informers:             &Informer{},
 		listers:               &Lister{},
@@ -264,6 +266,7 @@ func New(
 		defaultSSLCertificate: defaultSSLCertificate,
 	}
 
+	//  kubectl describe 命令看到的事件日志就是这个库产生的
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&clientcorev1.EventSinkImpl{
@@ -273,9 +276,13 @@ func New(
 		Component: "nginx-ingress-controller",
 	})
 
+	// 用于提取注释的对象
+	// 集中在internal/ingress/annotations目录
 	// k8sStore fulfills resolver.Resolver interface
 	store.annotations = annotations.NewAnnotationExtractor(store)
 
+	// 将数据再缓存一份用于本地查询，缓存的对象正如其名IngressWithAnnotation
+	// 会缓存internal/ingress/types.go:Ingress
 	store.listers.IngressWithAnnotation.Store = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
 
 	// As we currently do not filter out kubernetes objects we list, we can
@@ -305,11 +312,13 @@ func New(
 		}
 	}
 
+	// 创建informer工厂函数
 	// create informers factory, enable and assign required informers
 	infFactory := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
 		informers.WithNamespace(namespace),
 	)
 
+	// infFactoryConfigmaps, infFactorySecrets
 	// create informers factory for configmaps
 	infFactoryConfigmaps := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
 		informers.WithNamespace(namespace),
@@ -341,7 +350,9 @@ func New(
 
 	store.informers.Service = infFactory.Core().V1().Services().Informer()
 	store.listers.Service.Store = store.informers.Service.GetStore()
+	// 上面都是为了创建对应的informer对象，以及informer的缓存对象listers，用来查询最新数据
 
+	// 默认监听整个集群，返回true
 	// avoid caching namespaces at cluster scope when watching single namespace
 	if namespaceSelector != nil && !namespaceSelector.Empty() {
 		// cache informers factory for namespaces
@@ -791,6 +802,11 @@ func New(
 			}
 		},
 	}
+	// 以上都是各种事件监听函数, 分别设置对应事件的响应函数,一共有三个需要响应AddFunc,DeleteFunc,UpdateFunc.
+	// 而成功之后的逻辑一般分为三步
+	// 1. 业务逻辑
+	// 2. 同步数据到本地(如syncIngress, syncSecrets等)
+	// 3. 将数据传递给传递给updateCh, 即交由controller的主循环。
 
 	store.informers.Ingress.AddEventHandler(ingEventHandler)
 	if !icConfig.IgnoreIngressClass {
@@ -801,6 +817,7 @@ func New(
 	store.informers.ConfigMap.AddEventHandler(cmEventHandler)
 	store.informers.Service.AddEventHandler(serviceHandler)
 
+	// 在提供的helm charts里面会创建一个默认的configmap, 在这里就马上读取
 	// do not wait for informers to read the configmap configuration
 	ns, name, _ := k8s.ParseNameNS(configmap)
 	cm, err := client.CoreV1().ConfigMaps(ns).Get(context.TODO(), name, metav1.GetOptions{})
@@ -839,6 +856,8 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
 	key := k8s.MetaNamespaceKey(ing)
 	klog.V(3).Infof("updating annotations information for ingress %v", key)
 
+	// k8s的controller模式，一个很重要的范式就是，不要直接修改informer传递过来的对象
+	// 因为这个对象可能被多个controller引用，所以才叫共享的informer嘛(SharedInformer)
 	copyIng := &networkingv1.Ingress{}
 	ing.ObjectMeta.DeepCopyInto(&copyIng.ObjectMeta)
 
@@ -852,6 +871,7 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
 	ing.Spec.DeepCopyInto(&copyIng.Spec)
 	ing.Status.DeepCopyInto(&copyIng.Status)
 
+	// 处理一些ingress的rules
 	for ri, rule := range copyIng.Spec.Rules {
 		if rule.HTTP == nil {
 			continue
@@ -866,6 +886,8 @@ func (s *k8sStore) syncIngress(ing *networkingv1.Ingress) {
 
 	k8s.SetDefaultNGINXPathType(copyIng)
 
+	// 将数据更新到 IngressWithAnnotation
+	// 这个 ingress 是带注释的，即 ParsedAnnotations 字段
 	err := s.listers.IngressWithAnnotation.Update(&ingress.Ingress{
 		Ingress:           *copyIng,
 		ParsedAnnotations: s.annotations.Extract(ing),
@@ -1131,6 +1153,7 @@ func (s *k8sStore) setConfig(cmap *corev1.ConfigMap) {
 // synchronization of the secrets.
 func (s *k8sStore) Run(stopCh chan struct{}) {
 	// start informers
+	// 启动之前创建的所有informer
 	s.informers.Run(stopCh)
 }
 

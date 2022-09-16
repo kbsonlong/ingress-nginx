@@ -83,11 +83,13 @@ func NewTemplate(file string) (*Template, error) {
 		return nil, fmt.Errorf("unexpected error reading template %s: %w", file, err)
 	}
 
+	// 解析模板文件，添加自定义函数 funcMap
 	tmpl, err := text_template.New("nginx.tmpl").Funcs(funcMap).Parse(string(data))
 	if err != nil {
 		return nil, err
 	}
 
+	// 返回模板渲染后内容
 	return &Template{
 		tmpl: tmpl,
 		bp:   NewBufferPool(defBufferSize),
@@ -212,6 +214,7 @@ func (t *Template) Write(conf config.TemplateConfig) ([]byte, error) {
 	return res, nil
 }
 
+// 模板文件自定义方法
 var (
 	funcMap = text_template.FuncMap{
 		"empty": func(input interface{}) bool {
